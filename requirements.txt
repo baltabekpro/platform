@@ -1,0 +1,5 @@
+aiogram
+sqlite3
+google-generativeai
+apscheduler
+pytz
