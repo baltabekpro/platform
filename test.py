@@ -1,7 +1,9 @@
 import logging
 import sqlite3
 import uuid
+import sys
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.utils.formatting import Text
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -30,9 +32,10 @@ warnings.filterwarnings("ignore", message="Timezone offset does not match system
 
 BOT_TOKEN = '7840665570:AAGQK-0rG6SaZYuNpEE9w2G9WjgmbHcgCrY'
 GEMINI_API_KEYS = [
-    'AIzaSyCLXytzaJR4hcOMIstA8kzE1luMkkfakZQ'
+    'AIzaSyDDmhZ5byN13zbgC35Hlp4YLQYh-xiLCGc'
 ]
 current_api_key_index = 0
+ASSIGNMENTS_PER_PAGE = 1
 
 # Функция для получения текущего API-ключа
 def get_current_api_key():
@@ -57,8 +60,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log', encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -67,7 +70,7 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-model = genai.GenerativeModel('gemini-1.5-pro')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 generation_config = {
     "temperature": 0.9,
@@ -105,6 +108,7 @@ class UserStates(StatesGroup):
     waiting_for_user_name = State()
     waiting_for_class_name = State()
     waiting_for_class_selection = State()
+    waiting_for_student_selection = State()  # Добавлено новое состояние
     waiting_for_assignment = State()
     waiting_for_deadline_year = State()
     waiting_for_deadline_month = State()
@@ -113,9 +117,11 @@ class UserStates(StatesGroup):
     waiting_for_submission = State()
     waiting_for_assignment_method = State()
     editing_profile = State()
-    waiting_for_user_type = State()
     waiting_for_generation_request = State()
     waiting_for_generation_choice = State()
+    waiting_for_custom_deadline = State()
+    waiting_for_deadline = State()
+
 @contextmanager
 def get_db_connection():
     conn = sqlite3.connect('education_bot.db')
@@ -186,21 +192,44 @@ def get_student_class(student_id):
 def get_class_assignments(class_id):
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, text, deadline FROM assignments WHERE class_id = ?", (class_id,))
-        return c.fetchall()
+        c.execute("SELECT id, text, deadline FROM assignments WHERE class_id = ? ORDER BY id DESC", (class_id,))
+        assignments = c.fetchall()
+        logger.info(f"Retrieved assignments for class {class_id}: {assignments}")
+        return assignments
 
-def add_assignment(class_id, text, deadline):
+def prepare_assignment(class_id, text, deadline=None):
+    if text is None or text.strip() == "":
+        logger.error("Attempt to prepare assignment with None or empty text")
+        return None
+    
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT MAX(id) FROM assignments WHERE class_id = ?", (class_id,))
         max_id = c.fetchone()[0]
-        if max_id is None:
-            assignment_id = 1
-        else:
-            assignment_id = max_id + 1
+        assignment_id = max_id + 1 if max_id is not None else 1
+
+    return {
+        'class_id': class_id,
+        'id': assignment_id,
+        'text': text,
+        'deadline': deadline
+    }
+
+
+def add_assignment(class_id, text, deadline):
+    if text is None:
+        logger.error("Attempt to add assignment with None text")
+        return None
+    
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT MAX(id) FROM assignments WHERE class_id = ?", (class_id,))
+        max_id = c.fetchone()[0]
+        assignment_id = max_id + 1 if max_id is not None else 1
         c.execute("INSERT INTO assignments (class_id, id, text, deadline) VALUES (?, ?, ?, ?)",
                   (class_id, assignment_id, text, deadline))
         conn.commit()
+
         return assignment_id
 
 def add_submission(assignment_id, student_id, answer, evaluation, feedback):
@@ -227,7 +256,8 @@ def get_teacher_keyboard():
     builder.button(text="🔗 Мои ссылки")
     builder.button(text="📊 Статистика класса")
     builder.button(text="📝 Посмотреть мои задания")
-    builder.button(text="📊 Посмотреть оценки учеников")  # Новая кнопка
+    builder.button(text="📊 Посмотреть оценки учеников")
+    builder.button(text="✏️ Редактировать профиль")
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
@@ -442,88 +472,157 @@ async def add_assignment_start(message: types.Message, state: FSMContext):
 
 @dp.message(UserStates.waiting_for_generation_request)
 async def process_generation_request(message: types.Message, state: FSMContext):
-    update_api_key()  # Обновите API-ключ перед запросом
-    request = message.text
-    await state.update_data(generation_request=request)
+    try:
+        update_api_key()  # Обновляем API-ключ перед запросом
+        request = message.text
+        logger.info(f"Получен запрос на генерацию задания: {request}")
+        await state.update_data(generation_request=request)
 
-    # Генерация задания по запросу
-    prompt = f"Сгенерируйте задание по запросу: {request}"
-    response = chat.send_message(
-        prompt,
-        generation_config=generation_config,
-        safety_settings=safety_settings
-    )
-    generated_assignment = response.text
-    # ...
-    
-    await state.update_data(generated_assignment_text=generated_assignment)
-    
-    keyboard = InlineKeyboardBuilder()
-    keyboard.add(InlineKeyboardButton(
-        text="Выбрать",
-        callback_data="select_generated_assignment"
-    ))
-    keyboard.add(InlineKeyboardButton(
-        text="Сгенерировать новое задание",
-        callback_data="regenerate_assignment"
-    ))
-    keyboard.adjust(2)
+        # Получаем class_id из состояния
+        data = await state.get_data()
+        class_id = data.get('class_id')
+        logger.info(f"Class ID: {class_id}")
 
-    await message.reply("Сгенерированное задание:", reply_markup=keyboard.as_markup())
-    await message.reply(generated_assignment)
-    await state.set_state(UserStates.waiting_for_generation_choice)
+        # Генерация задания по запросу
+        prompt = f"Сгенерируйте задание по запросу: {request}. Пиши только само задание без дополнительных комментариев, критериев или сроков. Используй возможности форматирования Telegram.Создай такое задание которую ты можешь проверить не используй стороенные материалы и ссылки не давай задание где нужно использовать медиа"
+        logger.info(f"Отправка промпта в AI: {prompt}")
+        
+        response = chat.send_message(
+            prompt,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        generated_assignment = response.text
+        logger.info(f"Сгенерированный текст задания: {generated_assignment[:100]}...")  # Логируем первые 100 символов
+
+        # Сохраняем сгенерированный текст задания в состоянии
+        await state.update_data(generated_assignment_text=generated_assignment)
+        logger.info("Сгенерированный текст задания сохранен в состоянии")
+
+        keyboard = InlineKeyboardBuilder()
+        keyboard.add(InlineKeyboardButton(
+            text="Выбрать это задание",
+            callback_data="select_generated_assignment"
+        ))
+        keyboard.add(InlineKeyboardButton(
+            text="Сгенерировать новое",
+            callback_data="regenerate_assignment"
+        ))
+        keyboard.adjust(1)  # Размещаем кнопки в один столбец
+
+        # Отправляем сообщение с заданием
+        await message.answer("Сгенерированное задание:", reply_markup=keyboard.as_markup())
+        await message.answer(generated_assignment)
+        logger.info("Сообщение с сгенерированным заданием отправлено пользователю")
+
+        await state.set_state(UserStates.waiting_for_generation_choice)
+        logger.info("Установлено состояние waiting_for_generation_choice")
+
+    except Exception as e:
+        logger.error(f"Ошибка при генерации задания: {str(e)}")
+        await message.answer("Произошла ошибка при генерации задания. Пожалуйста, попробуйте еще раз.")
+        await state.set_state(UserStates.waiting_for_generation_request)
 
 
-@dp.callback_query(F.data == "select_generated_assignment")
+
+@dp.callback_query(F.data == "select_generated")
 async def process_select_generated_assignment(callback: types.CallbackQuery, state: FSMContext):
+    logger.info("Функция process_select_generated_assignment вызвана")
     data = await state.get_data()
     assignment_text = data.get('generated_assignment_text')
     class_id = data.get('class_id')
-    old_assignment_message_id = data.get('old_assignment_message_id')
     
-    # Сохранить задание в базу данных
-    assignment_id = add_assignment(class_id, assignment_text, None)
+    logger.info(f"Assignment text: {assignment_text[:50] if assignment_text else None}")
+    logger.info(f"Class ID: {class_id}")
     
-    if assignment_id:
-        # Отправить новое сообщение с заданием
-        new_message = await bot.send_message(chat_id=callback.message.chat.id, text=assignment_text)
+    if not assignment_text:
+        await callback.answer("Ошибка: текст задания не найден.")
+        return
+
+    if not class_id:
+        await callback.answer("Ошибка: класс не выбран.")
+        return
+
+    # Переходим к выбору дедлайна
+    await state.set_state(UserStates.waiting_for_deadline_year)
+    
+    # Используем существующую функцию для отображения клавиатуры выбора дедлайна
+    await callback.answer()
+    
+    
+@dp.callback_query(F.data == "select_generated_assignment")
+async def process_select_generated_assignment(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        logger.info("Начало обработки выбора сгенерированного задания")
         
-        # Хранить идентификатор нового сообщения с заданием
-        await state.update_data({'old_assignment_message_id': new_message.message_id})
+        data = await state.get_data()
+        generated_assignment_text = data.get('generated_assignment_text')
+        class_id = data.get('class_id')
         
-        # Создать клавиатуру с кнопкой "Выбрать дедлайн"
+        logger.info(f"Полученные данные: class_id={class_id}, текст задания={generated_assignment_text[:50] if generated_assignment_text else None}...")
+
+        if not generated_assignment_text or not class_id:
+            await callback.answer("Ошибка: текст задания или ID класса не найдены.")
+            logger.error(f"Отсутствуют данные: text={bool(generated_assignment_text)}, class_id={bool(class_id)}")
+            return
+
+        # Сохраняем текст задания в состоянии под ключом 'assignment_text'
+        await state.update_data(
+            assignment_text=generated_assignment_text,
+            selected_class_id=class_id,
+        )
+        
+        logger.info("Данные успешно сохранены в состоянии")
+
+        # Создаем клавиатуру с кнопкой "Выбрать дедлайн"
         keyboard = InlineKeyboardBuilder()
-        deadline_button = InlineKeyboardButton(
+        keyboard.add(InlineKeyboardButton(
             text="Выбрать дедлайн",
             callback_data="select_deadline"
-        )
-        generate_button = InlineKeyboardButton(
-            text="Сгенерировать новое задание",
-            callback_data="regenerate_assignment"
+        ))
+
+        # Отправляем сообщение с текстом задания
+        new_message = await callback.message.answer(
+            text=generated_assignment_text,
+            reply_markup=keyboard.as_markup()
         )
 
-        keyboard.add(deadline_button)
-        keyboard.add(generate_button)
-        keyboard.adjust(2)
+        # Сохраняем ID сообщения
+        await state.update_data(current_assignment_message_id=new_message.message_id)
         
-        # Отправить новое сообщение с меню
-        menu_message = await bot.send_message(
-            chat_id=callback.message.chat.id,
-            text="Выберите дедлайн для задания:",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await menu_message.edit_reply_markup(reply_markup=keyboard.as_markup())
+        logger.info(f"Сообщение с заданием отправлено, ID: {new_message.message_id}")
         
-        # Установить состояние ожидания выбора дедлайна
-        await state.set_state(UserStates.waiting_for_deadline_year)
-    else:
-        await bot.send_message(callback.message.chat.id, "Ошибка добавления задания. Пожалуйста, повторите попытку.")
+        # Отвечаем на callback
+        await callback.answer()
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке выбора задания: {e}")
+        await callback.answer("Произошла ошибка при выборе задания.")
+
+async def delete_old_messages(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    old_assignment_message_id = data.get('old_assignment_message_id')
+    old_menu_message_id = data.get('old_menu_message_id')
+
+    # Удаляем старое сообщение с заданием
+    if old_assignment_message_id:
+        try:
+            await bot.delete_message(chat_id=callback.message.chat.id, message_id=old_assignment_message_id)
+        except Exception as e:
+            logger.error(f"Ошибка при удалении старого сообщения с заданием: {e}")
+
+    # Удаляем старое меню
+    if old_menu_message_id:
+        try:
+            await bot.delete_message(chat_id=callback.message.chat.id, message_id=old_menu_message_id)
+        except Exception as e:
+            logger.error(f"Ошибка при удалении старого меню: {e}")
+
 @dp.callback_query(F.data == "select_deadline")
 async def process_select_deadline(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Выберите дату дедлайна:", 
                                     reply_markup=get_calendar_keyboard(datetime.now().year, datetime.now().month))
     await state.set_state(UserStates.waiting_for_deadline_year)
-
 
 @dp.callback_query(F.data == "regenerate_assignment")
 async def process_regenerate_assignment(callback: types.CallbackQuery, state: FSMContext):
@@ -538,6 +637,10 @@ async def process_regenerate_assignment(callback: types.CallbackQuery, state: FS
         safety_settings=safety_settings
     )
     generated_assignment = response.text
+    
+    # Сохраняем новое задание в состоянии
+    await state.update_data(generated_assignment_text=generated_assignment)
+    
     
     keyboard = InlineKeyboardBuilder()
     select_button = InlineKeyboardButton(
@@ -616,28 +719,67 @@ async def process_assignment_method(callback: types.CallbackQuery, state: FSMCon
 async def process_class_selection(callback: types.CallbackQuery, state: FSMContext):
     class_id = callback.data.split(":")[1]
     await state.update_data(class_id=class_id)
-    
+
+    # Получаем учеников в выбранном классе
+    students = get_class_students(class_id)
+    if not students:
+        await callback.message.reply("В этом классе нет учеников.")
+        return
+
+    # Создаем клавиатуру для выбора ученика
     keyboard = InlineKeyboardBuilder()
-    keyboard.add(InlineKeyboardButton(
-        text="Добавить свое задание",
-        callback_data="add_own_assignment"
-    ))
-    keyboard.add(InlineKeyboardButton(
-        text="Сгенерировать задание",
-        callback_data="generate_assignment"
-    ))
+    for student_id, student_name in students:
+        keyboard.add(InlineKeyboardButton(text=student_name, callback_data=f"student:{student_id}"))
     keyboard.adjust(2)
-    
-    await callback.message.edit_text("Выберите способ добавления задания:", reply_markup=keyboard.as_markup())
-    await state.set_state(UserStates.waiting_for_assignment_method)
+
+    await callback.message.reply("Выберите ученика:", reply_markup=keyboard.as_markup())
+    await state.set_state(UserStates.waiting_for_student_selection)
+
+@dp.callback_query(F.data.startswith("student:"))
+async def process_student_selection(callback: types.CallbackQuery, state: FSMContext):
+    student_id = callback.data.split(":")[1]
+    data = await state.get_data()
+    class_id = data.get('class_id')
+
+    # Получаем оценки для выбранного ученика
+    grades = get_student_grades_for_class(student_id, class_id)
+    if not grades:
+        await callback.message.reply("У этого ученика нет оценок.")
+        return
+
+    # Формируем ответ с оценками
+    response = "📊 Оценки ученика:\n\n"
+    for assignment_text, evaluation in grades:
+        # Отображаем только первую строку задания
+        first_line = assignment_text.split('\n')[0]  # Получаем первую строку
+        response += f"📝 Задание: {first_line}\n📈 Оценка: {evaluation}/10\n\n"
+
+    await callback.message.reply(response or "Нет оценок для этого ученика.")
+    await callback.answer()
+
+def get_student_grades_for_class(student_id, class_id):
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT a.text, s.evaluation
+            FROM submissions s
+            JOIN assignments a ON s.assignment_id = a.id
+            WHERE s.student_id = ? AND a.class_id = ?
+        """, (student_id, class_id))
+        return c.fetchall()
 
 @dp.message(UserStates.waiting_for_assignment)
 async def process_assignment(message: types.Message, state: FSMContext):
-    await state.update_data(assignment_text=message.text)
+    assignment_text = message.text.strip()  # Удаляем лишние пробелы
+    await state.update_data(assignment_text=assignment_text)
+
+    logger.info(f"Текст задания сохранен: {assignment_text}")  # Логируем текст задания
+    
     current_year = datetime.now().year
     await message.reply("Выберите дату дедлайна:", 
                         reply_markup=get_calendar_keyboard(current_year, datetime.now().month))
     await state.set_state(UserStates.waiting_for_deadline_year)
+
 
 @dp.callback_query(F.data.startswith("month:"))
 async def process_month_selection(callback: types.CallbackQuery):
@@ -684,80 +826,144 @@ async def process_hour_selection(callback: types.CallbackQuery, state: FSMContex
 
 @dp.callback_query(F.data.startswith("minute:"))
 async def process_time_selection(callback: types.CallbackQuery, state: FSMContext):
-    minute = callback.data.split(":")[1]
-    data = await state.get_data()
-    deadline_date = data['deadline_date']
-    deadline_hour = data['deadline_hour']
-    deadline_str = f"{deadline_date} {deadline_hour}:{minute}"
-    
-    class_id = data.get('class_id')
-    assignment_text = data.get('generated_assignment_text')
-    assignment_id = add_assignment(class_id, assignment_text, deadline_str)
-    
-    if assignment_id:
-        # Get deadline from database
-        with get_db_connection() as conn:
-            c = conn.cursor()
-            c.execute("SELECT deadline FROM assignments WHERE id = ?", (assignment_id,))
-            deadline = c.fetchone()[0]
-            deadline = datetime.strptime(deadline, '%Y-%m-%d %H:%M')
+    try:
+        logger.info(f"Начало обработки выбора времени. Callback data: {callback.data}")
+        
+        minute = callback.data.split(":")[1]
+        data = await state.get_data()
+        
+        logger.info(f"Полученные данные из состояния: {data}")
+        
+        deadline_date = data.get('deadline_date')
+        deadline_hour = data.get('deadline_hour')
+        selected_class_id = data.get('class_id')  # Изменено с 'selected_class_id' на 'class_id'
+        selected_assignment_text = data.get('assignment_text')  
+        
+        logger.info(f"Извлеченные данные: date={deadline_date}, hour={deadline_hour}, class_id={selected_class_id}, text={selected_assignment_text[:50] if selected_assignment_text else None}...")
+        
+  
+        
+        # Подробная проверка наличия всех необходимых данных
+        if not deadline_date:
+            await callback.answer("Ошибка: отсутствует дата дедлайна.")
+            logger.error("Отсутствует дата дедлайна")
+            return
+        if not deadline_hour:
+            await callback.answer("Ошибка: отсутствует час дедлайна.")
+            logger.error("Отсутствует час дедлайна")
+            return
+        if not selected_class_id:
+            await callback.answer("Ошибка: не выбран класс.")
+            logger.error("Не выбран класс")
+            return
+        if not selected_assignment_text:
+            await callback.answer("Ошибка: текст задания отсутствует.")
+            logger.error("Отсутствует текст задания")
+            return
+        
+        deadline_str = f"{deadline_date} {deadline_hour}:{minute}"
+        logger.info(f"Сформированная строка дедлайна: {deadline_str}")
+        
+        try:
+            deadline = datetime.strptime(deadline_str, '%Y-%m-%d %H:%M')
             deadline = TIMEZONE.localize(deadline)
+            logger.info(f"Преобразованный дедлайн: {deadline}")
+        except ValueError as e:
+            await callback.answer("Ошибка: неверный формат даты или времени.")
+            logger.error(f"Ошибка при преобразовании даты: {e}")
+            return
         
-        new_text = f"Задание успешно добавлено!\nТекст: {assignment_text}\nДедлайн: {deadline_str}"
+        # Добавление задания в базу данных
+        try:
+            with get_db_connection() as conn:
+                c = conn.cursor()
+                c.execute("INSERT INTO assignments (class_id, text, deadline) VALUES (?, ?, ?)", 
+                          (selected_class_id, selected_assignment_text, deadline.strftime('%Y-%m-%d %H:%M')))
+                conn.commit()
+                new_assignment_id = c.lastrowid
+            logger.info(f"Задание успешно добавлено!")
+        except Exception as e:
+            await callback.answer("Ошибка при сохранении задания в базу данных.")
+            logger.error(f"Ошибка при добавлении задания в БД: {e}")
+            return
         
-        await bot.send_message(callback.message.chat.id, new_text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        # Удаление старых сообщений
+        old_assignment_message_id = data.get('current_assignment_message_id')
+        old_menu_message_id = data.get('current_menu_message_id')
         
-        asyncio.create_task(schedule_results_sending(assignment_id, deadline))
-        
-        students = get_class_students(class_id)
-        for student_id, student_name in students:
+        if old_assignment_message_id:
             try:
-                await bot.send_message(
-                    student_id,
-                    f"📚 Новое задание:\n{assignment_text}\n📅 Дедлайн: {deadline_str}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_notification=True
-                )
+                await bot.delete_message(chat_id=callback.message.chat.id, message_id=old_assignment_message_i )
+                logger.info(f"Старое сообщение задания удалено!")
             except Exception as e:
-                logger.error(f"Ошибка отправки сообщения ученику {student_id}: {e}")
-    else:
-        await bot.send_message(callback.message.chat.id, "Ошибка добавления задания. Пожалуйста, повторите попытку.")
+                logger.error(f"Ошибка при удалении старого сообщения задания: {e}")
+        
+        if old_menu_message_id:
+            try:
+                await bot.delete_message(chat_id=callback.message.chat.id, message_id=old_menu_message_id)
+                logger.info(f"Старое меню удалено. ID: {old_menu_message_id}")
+            except Exception as e:
+                logger.error(f"Ошибка при удалении старого меню: {e}")
+        
+        # Создание нового сообщения задания
+        try:
+            new_assignment_message = await callback.message.answer(f"Задание создано успешно! ID: {new_assignment_id}")
+            logger.info(f"Новое сообщение задания создано. ID: {new_assignment_message.message_id}")
+        except Exception as e:
+            logger.error(f"Ошибка при создании нового сообщения задания: {e}")
+        
+        # Обновление состояния
+        await state.update_data(current_assignment_message_id=new_assignment_message.message_id)
+        logger.info(f"Состояние обновлено. current_assignment_message_id: {new_assignment_message.message_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке выбора времени: {e}")
+        await callback.answer("Произошла ошибка при создании задания.")
+
 @dp.callback_query(F.data.startswith("submit:"))
 async def process_submission_selection(callback: types.CallbackQuery, state: FSMContext):
-    assignment_id = callback.data.split(":")[1]
-    await state.update_data(assignment_id=assignment_id)
-    await callback.message.reply("Введите ваш ответ на задание:")
-    await callback.answer()
+    try:
+        assignment_id = callback.data.split(":")[1]
+        await state.update_data(assignment_id=assignment_id)
+        await callback.message.reply("Введите ваш ответ на задание:")
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Ошибка при обработке выбора задания для ответа: {e}")
+        await callback.answer("Произошла ошибка. Пожалуйста, попробуйте еще раз.")
 
 @dp.message(F.text == "🔗 Мои ссылки")
 async def show_links(message: types.Message):
-    teacher_id = message.from_user.id
-    
-    with get_db_connection() as conn:
-        c = conn.cursor()
+    try:
+        teacher_id = message.from_user.id
         
-        # Получаем все классы, созданные учителем
-        c.execute("SELECT id, class_name FROM classes WHERE teacher_id = ?", (teacher_id,))
-        classes = c.fetchall()
-        
-        if classes:
-            response = "Мои ссылки:\n\n"
-            for class_id, class_name in classes:
-                # Получаем реферальную ссылку из таблицы links по class_id
-                c.execute("SELECT link FROM links WHERE class_id = ?", (class_id,))
-                link_results = c.fetchall()
-                
-                if link_results:
-                    response += f"{class_name}:\n"
-                    for link in link_results:
-                        response += f"Присоединиться к классу: {link[0]}\n"
-                        
-                else:
-                    response += f"{class_name}: У вас пока нет ссылок.\n\n"
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            
+            # Получаем все классы, созданные учителем
+            c.execute("SELECT id, class_name FROM classes WHERE teacher_id = ?", (teacher_id,))
+            classes = c.fetchall()
+            
+            if classes:
+                response = "Мои ссылки:\n\n"
+                for class_id, class_name in classes:
+                    # Получаем реферальную ссылку из таблицы links по class_id
+                    c.execute("SELECT link FROM links WHERE class_id = ?", (class_id,))
+                    link_results = c.fetchall()
                     
-            await message.reply(response)
-        else:
-            await message.reply("Вы не создали ни одного класса.")
+                    if link_results:
+                        response += f"{class_name}:\n"
+                        for link in link_results:
+                            response += f"Присоединиться к классу: {link[0]}\n"
+                            
+                    else:
+                        response += f"{class_name}: У вас пока нет ссылок.\n\n"
+                        
+                await message.reply(response)
+            else:
+                await message.reply("Вы не создали ни одного класса.")
+    except Exception as e:
+        logger.error(f"Ошибка при отображении ссылок: {e}")
+        await message.reply("Произошла ошибка при получении ссылок. Попробуйте позже.")
 
 @dp.message(F.text.startswith("/copy_"))
 async def copy_link(message: types.Message):
@@ -776,24 +982,94 @@ async def copy_link(message: types.Message):
         else:
             await message.reply("Ссылка не найдена.")
 @dp.message(F.text == "📚 Мои задания")
-async def show_assignments(message: types.Message):
+async def show_assignments(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     student_class_id = get_student_class(user_id)
+
     if not student_class_id:
         await message.reply("Вы не зарегистрированы в классе.")
         return
+
+    assignments = get_class_assignments(student_class_id)
+    total_assignments = len(assignments)
+
+    if total_assignments == 0:
+        await message.reply("У вас пока нет заданий.")
+        return
+
+    # Сохраняем задания и текущую страницу в состоянии
+    await state.update_data(assignments=assignments, current_page=0)
+    await send_assignments_page(chat_id=message.chat.id, message_id=message.message_id, assignments=assignments, page=0)
+
+async def send_assignments_page(callback=None, chat_id=None, message_id=None, assignments=None, page=None):
+    if callback:
+        chat_id = callback.message.chat.id
+        message_id = callback.message.message_id
+    elif chat_id and message_id and assignments and page is not None:
+        pass
+    else:
+        raise ValueError("Недостаточно аргументов")
+
+    # Проверка, что page не None
+    if page is None:
+        raise ValueError("page не может быть None")
+
+    start_index = page * ASSIGNMENTS_PER_PAGE
+    end_index = start_index + ASSIGNMENTS_PER_PAGE
+    assignments_to_send = assignments[start_index:end_index]
+
+    if not assignments_to_send:
+        await bot.send_message(chat_id, "Это последняя страница.")
+        return
+
+    response = "📝 Ваши задания:\n\n"
+    for assignment in assignments_to_send:
+        response += f"📚 Задание: {assignment[1]}\n📅 Дедлайн: {assignment[2]}\n\n"
+
+    keyboard = InlineKeyboardBuilder()
     
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT text, deadline FROM assignments WHERE class_id = ?", (student_class_id,))
-        assignments = c.fetchall()
-        if assignments:
-            response = "📚 Мои задания:\n\n"
-            for assignment in assignments:
-                response += f"📝 {assignment[0]}\n📅 {assignment[1]}\n\n"
-            await message.reply(response)
-        else:
-            await message.reply("У вас пока нет заданий.")
+    # Добавляем кнопку "Назад", если это не первая страница
+    if page > 0:
+        keyboard.add(InlineKeyboardButton(text="◀️ Назад", callback_data=f"assignments_page:{page - 1}"))
+    
+    # Добавляем кнопку "Вперед", если есть еще страницы
+    if end_index < len(assignments):
+        keyboard.add(InlineKeyboardButton(text="▶️ Вперед", callback_data=f"assignments_page:{page + 1}"))
+
+    if callback:
+        await bot.edit_message_text(
+            text=response,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=keyboard.as_markup()
+        )
+    else:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=response,
+            reply_markup=keyboard.as_markup()
+        )
+@dp.callback_query(F.data.startswith("assignments_page:"))
+async def process_assignments_page(callback: types.CallbackQuery, state: FSMContext):
+    # Извлекаем номер страницы из callback.data
+    page = int(callback.data.split(":")[1])
+
+    # Получаем данные из состояния
+    data = await state.get_data()
+    assignments = data.get("assignments")
+
+    # Проверка наличия заданий
+    if assignments is None:
+        await callback.answer("Задания не найдены.")
+        return
+
+    # Проверка границ страницы
+    if page < 0 or page >= (len(assignments) + ASSIGNMENTS_PER_PAGE - 1) // ASSIGNMENTS_PER_PAGE:
+        await callback.answer("Некорректный номер страницы.")
+        return
+
+    await send_assignments_page(callback=callback, assignments=assignments, page=page)
+    await callback.answer()  # Убедитесь, что вы отвечаете на callback
 
 @dp.message(UserStates.waiting_for_submission)
 async def process_submission(message: types.Message, state: FSMContext):
@@ -931,6 +1207,8 @@ async def process_class_name(message: types.Message, state: FSMContext):
     await state.clear()
 
 # Statistics
+
+
 @dp.message(F.text == "📊 Статистика класса")
 async def show_class_statistics(message: types.Message):
     if not is_teacher(message.from_user.id):
@@ -943,68 +1221,72 @@ async def show_class_statistics(message: types.Message):
         return
     
     for class_id, class_name in classes:
-        stats = get_assignment_statistics(class_id)
-        if stats:
-            response = f"📊 Статистика класса {class_name}:\n\n"
-            for assignment_id, text, deadline, submissions, avg_score in stats:
-                response += f"📝 Задание: {text}\n"
-                response += f"📅 Дедлайн: {deadline}\n"
-                response += f"📤 Отправлено работ: {submissions}\n"
-                if avg_score is not None:
-                    response += f"📈 Средний балл: {avg_score:.1f}/10\n\n"
-                else:
-                    response += "📈 Средний балл: Нет данных\n\n"
-        else:
-            response = f"В классе {class_name} пока нет заданий."
-        
-        await message.reply(response, parse_mode=ParseMode.MARKDOWN)
+        try:
+            stats = get_assignment_statistics(class_id)
+            if stats:
+                response = f"📊 <b>Статистика класса {class_name}:</b>\n\n"
+                for assignment_id, text, deadline, submissions, avg_score in stats:
+                    # Обрезаем текст задания, если он слишком длинный
+                    short_text = text[:50] + "..." if len(text) > 50 else text
+                    response += f"📝 <b>Задание:</b> {short_text}\n"
+                    response += f"📅 <b>Дедлайн:</b> {deadline}\n"
+                    response += f"📤 <b>Отправлено работ:</b> {submissions}\n"
+                    if avg_score is not None:
+                        response += f"📈 <b>Средний балл:</b> {avg_score:.1f}/10\n\n"
+                    else:
+                        response += "📈 <b>Средний балл:</b> Нет данных\n\n"
+            else:
+                response = f"В классе {class_name} пока нет заданий."
 
+            # Разбиваем длинные сообщения на части
+            max_length = 4000
+            for i in range(0, len(response), max_length):
+                part = response[i:i+max_length]
+                await message.answer(part, parse_mode="HTML")
+                
+        except Exception as e:
+            logger.error(f"Ошибка при получении статистики для класса {class_name}: {e}")
+            await message.answer(f"Произошла ошибка при получении статистики для класса {class_name}")
 # Teacher assignments
 @dp.message(F.text == "📝 Посмотреть мои задания")
-async def show_teacher_assignments(message: types.Message):
+async def show_teacher_assignments(message: types.Message, state: FSMContext):
     if not is_teacher(message.from_user.id):
         await message.reply("Эта функция доступна только для учителей.")
         return
     
     assignments = get_teacher_assignments(message.from_user.id)
-    if not assignments:
+    total_assignments = len(assignments)
+
+    if total_assignments == 0:
         await message.reply("У вас пока нет созданных заданий.")
         return
-    
-    response = "📝 Ваши задания:\n\n"
-    for class_name, assignment_text, deadline in assignments:
-        response += f"📚 Класс: {class_name}\n"
-        response += f"📝 Задание: {assignment_text}\n"
-        response += f"📅 Дедлайн: {deadline}\n\n"
-    
-    await message.reply(response, parse_mode=ParseMode.MARKDOWN)
+
+    # Сохраняем задания и текущую страницу в состоянии
+    await state.update_data(assignments=assignments, current_page=0)
+    await send_assignments_page(chat_id=message.chat.id, message_id=message.message_id, assignments=assignments, page=0)
+
 
 # Student grades
 @dp.message(F.text == "📊 Посмотреть оценки учеников")
-async def show_student_grades(message: types.Message):
+async def show_student_grades(message: types.Message, state: FSMContext):
     if not is_teacher(message.from_user.id):
         await message.reply("Эта функция доступна только для учителей.")
         return
-    
+
+    # Получаем классы учителя
     classes = get_teacher_classes(message.from_user.id)
     if not classes:
         await message.reply("У вас пока нет классов.")
         return
-    
-    response = "📊 Оценки учеников по классам:\n\n"
-    
+
+    # Создаем клавиатуру для выбора класса
+    keyboard = InlineKeyboardBuilder()
     for class_id, class_name in classes:
-        grades = get_student_grades(class_id)
-        if grades:
-            response += f"Класс: {class_name}\n"
-            for student_name, assignment_text, evaluation in grades:
-                response += f"👤 Студент: {student_name}\n"
-                response += f"📝 Задание: {assignment_text}\n"
-                response += f"📈 Оценка: {evaluation}/10\n\n"
-        else:
-            response += f"Класс: {class_name}\nНет оценок для этого класса.\n\n"
-    
-    await message.reply(response or "Нет оценок для всех классов.", parse_mode=ParseMode.MARKDOWN)
+        keyboard.add(InlineKeyboardButton(text=class_name, callback_data=f"class:{class_id}"))
+    keyboard.adjust(2)
+
+    await message.reply("Выберите класс:", reply_markup=keyboard.as_markup())
+    await state.set_state(UserStates.waiting_for_class_selection)
 
 # Helper functions
 def get_student_grades(class_id):
