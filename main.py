@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import uuid
+import hashlib
 import sys
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.utils.formatting import Text
@@ -10,12 +11,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.command import Command
 import google.generativeai as genai
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import asyncio
 from aiogram.types import CallbackQuery
 import os
 import warnings
 from aiogram.types import Message
+from typing import Union
 from aiogram.enums import ParseMode
 from datetime import datetime, timedelta
 import calendar
@@ -129,45 +132,124 @@ def get_db_connection():
     finally:
         conn.close()
 
+def generate_referral_link(class_id):
+    # Генерация уникального идентификатора
+    unique_id = str(uuid.uuid4())
+    
+    # Создание базовой ссылки
+    base_link = f"https://t.me/edustud_bot?start={class_id}"
+    
+    # Добавление уникального идентификатора к ссылке
+    referral_link = f"{base_link}&ref={unique_id}"
+    
+    # Хеширование ссылки для повышения безопасности
+    hashed_link = hashlib.sha256(referral_link.encode()).hexdigest()
+    
+    return referral_link, hashed_link
+
+def get_user_type_keyboard():
+    # Создаем кнопки
+    button_teacher = KeyboardButton(text="Учитель")
+    button_student = KeyboardButton(text="Ученик")
+    
+    # Создаем клавиатуру
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [button_teacher],
+            [button_student]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+
 def init_db():
     with get_db_connection() as conn:
         c = conn.cursor()
+        
+        # Создание таблицы учителей
         c.execute('''CREATE TABLE IF NOT EXISTS teachers
-                     (id INTEGER PRIMARY KEY, name TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS students
-                     (id INTEGER PRIMARY KEY, name TEXT, class_id INTEGER)''')
+                     (id INTEGER PRIMARY KEY, 
+                      name TEXT NOT NULL)''')
+        
+        # Создание таблицы классов
         c.execute('''CREATE TABLE IF NOT EXISTS classes
-                     (id INTEGER PRIMARY KEY, teacher_id INTEGER, class_name TEXT)''')
+                     (id INTEGER PRIMARY KEY, 
+                      teacher_id INTEGER,
+                      class_name TEXT NOT NULL,
+                      FOREIGN KEY (teacher_id) REFERENCES teachers(id))''')
+        
+        # Создание таблицы учеников (без привязки к конкретному классу)
+        c.execute('''CREATE TABLE IF NOT EXISTS students
+                     (id INTEGER PRIMARY KEY, 
+                      name TEXT NOT NULL)''')
+        
+        # Создание таблицы связи учеников и классов
+        c.execute('''CREATE TABLE IF NOT EXISTS student_classes
+                     (student_id INTEGER,
+                      class_id INTEGER,
+                      FOREIGN KEY (student_id) REFERENCES students(id),
+                      FOREIGN KEY (class_id) REFERENCES classes(id),
+                      PRIMARY KEY (student_id, class_id))''')
+        
+        # Создание таблицы заданий
         c.execute('''CREATE TABLE IF NOT EXISTS assignments
-                     (id INTEGER PRIMARY KEY, class_id INTEGER, text TEXT, deadline DATETIME)''')
+                     (id INTEGER PRIMARY KEY, 
+                      class_id INTEGER, 
+                      text TEXT NOT NULL, 
+                      deadline DATETIME,
+                      FOREIGN KEY (class_id) REFERENCES classes(id))''')
+        
+        # Создание таблицы ответов на задания с оценкой
         c.execute('''CREATE TABLE IF NOT EXISTS submissions
-                     (id INTEGER PRIMARY KEY, assignment_id INTEGER, student_id INTEGER, 
-                      answer TEXT, evaluation REAL, feedback TEXT)''')
+                     (id INTEGER PRIMARY KEY, 
+                      assignment_id INTEGER, 
+                      student_id INTEGER, 
+                      answer TEXT,
+                      evaluation REAL,
+                      grade REAL,
+                      feedback TEXT,
+                      FOREIGN KEY (assignment_id) REFERENCES assignments(id),
+                      FOREIGN KEY (student_id) REFERENCES students(id))''')
+        
+        # Создание таблицы ссылок
         c.execute('''CREATE TABLE IF NOT EXISTS links
-                     (id INTEGER PRIMARY KEY, class_id INTEGER, link TEXT)''')
+                     (id INTEGER PRIMARY KEY, 
+                      class_id INTEGER, 
+                      link TEXT NOT NULL,
+                      FOREIGN KEY (class_id) REFERENCES classes(id))''')
+        
+        # Создание таблицы связи учителей и классов
+        c.execute('''CREATE TABLE IF NOT EXISTS teacher_classes
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      teacher_id INTEGER NOT NULL,
+                      class_id INTEGER NOT NULL,
+                      FOREIGN KEY (teacher_id) REFERENCES teachers(id),
+                      FOREIGN KEY (class_id) REFERENCES classes(id),
+                      UNIQUE(teacher_id, class_id))''')
+        
         conn.commit()
 
-def show_links(user_id):
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        # Сначала получаем class_id пользователя из таблицы students
-        c.execute("SELECT class_id FROM students WHERE id = ?", (user_id,))
-        class_id = c.fetchone()[0]
-        
-        # Затем получаем ссылку из таблицы links по class_id
-        c.execute("SELECT link FROM links WHERE class_id = ?", (class_id,))
-        link = c.fetchone()[0]
-        
-        # Возвращаем ссылку
-        return link
 
-# Database operations
 def add_student(student_id, name, class_id):
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO students (id, name, class_id) VALUES (?, ?, ?)",
-                  (student_id, name, class_id))
+        c.execute("INSERT OR IGNORE INTO students (id, name) VALUES (?, ?)",
+                  (student_id, name))
+        c.execute("INSERT OR IGNORE INTO student_classes (student_id, class_id) VALUES (?, ?)",
+                  (student_id, class_id))
         conn.commit()
+
+def get_student_classes(student_id):
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT c.id, c.class_name
+            FROM classes c
+            JOIN student_classes sc ON c.id = sc.class_id
+            WHERE sc.student_id = ?
+        """, (student_id,))
+        return c.fetchall()
 
 def is_teacher(user_id):
     with get_db_connection() as conn:
@@ -196,23 +278,6 @@ def get_class_assignments(class_id):
         logger.info(f"Retrieved assignments for class {class_id}: {assignments}")
         return assignments
 
-def prepare_assignment(class_id, text, deadline=None):
-    if text is None or text.strip() == "":
-        logger.error("Attempt to prepare assignment with None or empty text")
-        return None
-    
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT MAX(id) FROM assignments WHERE class_id = ?", (class_id,))
-        max_id = c.fetchone()[0]
-        assignment_id = max_id + 1 if max_id is not None else 1
-
-    return {
-        'class_id': class_id,
-        'id': assignment_id,
-        'text': text,
-        'deadline': deadline
-    }
 
 
 def add_assignment(class_id, text, deadline):
@@ -225,11 +290,19 @@ def add_assignment(class_id, text, deadline):
         c.execute("SELECT MAX(id) FROM assignments WHERE class_id = ?", (class_id,))
         max_id = c.fetchone()[0]
         assignment_id = max_id + 1 if max_id is not None else 1
+        
+        # Убедитесь, что deadline в правильном формате
+        if isinstance(deadline, datetime):
+            deadline_str = deadline.strftime('%Y-%m-%d %H:%M')
+        else:
+            deadline_str = deadline
+        
         c.execute("INSERT INTO assignments (class_id, id, text, deadline) VALUES (?, ?, ?, ?)",
-                  (class_id, assignment_id, text, deadline))
+                  (class_id, assignment_id, text, deadline_str))
         conn.commit()
 
         return assignment_id
+
 
 def add_submission(assignment_id, student_id, answer, evaluation, feedback):
     with get_db_connection() as conn:
@@ -266,8 +339,18 @@ def get_student_keyboard():
     builder.button(text="📚 Мои задания")
     builder.button(text="📝 Отправить работу")
     builder.button(text="✏️ Редактировать профиль")
+    builder.button(text="🔄 Сменить класс")
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
+async def show_student_menu(message: types.Message, class_id: int):
+    keyboard = ReplyKeyboardBuilder()
+    keyboard.button(text="👤 Мой профиль")
+    keyboard.button(text="📚 Мои задания")
+    keyboard.button(text="📝 Отправить работу")
+    keyboard.button(text="✏️ Редактировать профиль")
+    keyboard.button(text="🔄 Сменить класс")
+    keyboard.adjust(2)
+    
 
 def get_calendar_keyboard(year, month):
     builder = InlineKeyboardBuilder()
@@ -306,24 +389,87 @@ def get_calendar_keyboard(year, month):
     
     return builder.as_markup()
 
-# Command handlers
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     args = message.text.split()[1:] if len(message.text.split()) > 1 else None
-    
-    if args:  
+    user_id = message.from_user.id
+
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name FROM teachers WHERE id = ?", (user_id,))
+        teacher = c.fetchone()
+        c.execute("SELECT id, name FROM students WHERE id = ?", (user_id,))
+        student = c.fetchone()
+
+    if args:
         class_id = args[0]
-        await message.reply("Добро пожаловать! Вы присоединяетесь к классу. Введите ваше имя.")
-        await state.set_state(UserStates.waiting_for_user_name)
-        await state.update_data(class_id=class_id)
-    else:  
-        profile = get_user_profile(message.from_user.id)
-        if profile:
-            keyboard = get_teacher_keyboard() if profile['type'] == 'teacher' else get_student_keyboard()
-            await message.reply(f"С возвращением, {profile['name']}!", reply_markup=keyboard)
+        if student:
+            try:
+                with get_db_connection() as conn:
+                    c = conn.cursor()
+                    c.execute("INSERT OR IGNORE INTO student_classes (student_id, class_id) VALUES (?, ?)",
+                              (user_id, class_id))
+                    conn.commit()
+                await message.reply("Вы успешно добавлены в новый класс!")
+                await show_class_selection(message, state)
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении в класс: {e}")
+                await message.reply("Произошла ошибка при добавлении в класс.")
         else:
-            await message.reply("Добро пожаловать! Вы учитель или ученик? (Введите 'учитель' или 'ученик')")
+            await message.reply("Введите ваше имя:")
+            await state.set_state(UserStates.waiting_for_user_name)
+            await state.update_data(class_id=class_id)
+    else:
+        if teacher:
+            await message.reply(f"С возвращением, {teacher[1]}!", 
+                              reply_markup=get_teacher_keyboard())
+        elif student:
+            await show_class_selection(message, state)
+        else:
+            await message.reply("Добро пожаловать! Вы учитель или ученик?", 
+                              reply_markup=get_user_type_keyboard())
             await state.set_state(UserStates.waiting_for_user_type)
+
+async def show_class_selection(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    classes = get_student_classes(user_id)
+    
+    if not classes:
+        await message.reply("Вы пока не присоединились ни к одному классу.")
+        return
+
+    keyboard = InlineKeyboardBuilder()
+    for class_id, class_name in classes:
+        keyboard.add(InlineKeyboardButton(
+            text=class_name,
+            callback_data=f"select_class:{class_id}"
+        ))
+    keyboard.adjust(1)
+    
+    # Сохраняем список классов в состоянии
+    await state.update_data(available_classes=classes)
+    
+    await message.reply("Выберите класс:", reply_markup=keyboard.as_markup())
+
+
+@dp.message(F.text == "🔄 Сменить класс")
+async def change_class(message: types.Message, state: FSMContext):
+    await show_class_selection(message, state)
+
+
+@dp.callback_query(lambda c: c.data.startswith("select_class:"))
+async def process_class_selection(callback: CallbackQuery, state: FSMContext):
+    class_id = int(callback.data.split(":")[1])
+    
+    # Сохраняем выбранный класс в состоянии пользователя
+    await state.update_data(current_class_id=class_id)
+    
+    # Получаем название класса
+    class_name = get_class_name(class_id)
+    
+    # Отправляем сообщение о выбранном классе и показываем меню студента
+    await callback.message.edit_text(f"Вы выбрали класс: {class_name}")
+    await show_student_menu(callback.message, class_id)
 
 @dp.message(UserStates.waiting_for_user_type)
 async def process_user_type(message: types.Message, state: FSMContext):
@@ -333,27 +479,36 @@ async def process_user_type(message: types.Message, state: FSMContext):
         await message.reply("Введите ваше имя:")
         await state.set_state(UserStates.waiting_for_user_name)
     else:
-        await message.reply("Пожалуйста, введите 'учитель' или 'ученик'.")
+        await message.reply("Пожалуйста, выберите 'Учитель' или 'Ученик'.", reply_markup=get_user_type_keyboard())
 
 @dp.message(UserStates.waiting_for_user_name)
 async def process_name(message: types.Message, state: FSMContext):
     data = await state.get_data()
     class_id = data.get('class_id')
     user_type = data.get('user_type')
+    user_id = message.from_user.id
     
     try:
-        if class_id:  
-            add_student(message.from_user.id, message.text, class_id)
-            await message.reply("Вы успешно зарегистрированы в классе!", reply_markup=get_student_keyboard())
+        if class_id:  # Регистрация ученика через ссылку
+            with get_db_connection() as conn:
+                c = conn.cursor()
+                # Добавляем ученика в таблицу students
+                c.execute("INSERT INTO students (id, name) VALUES (?, ?)", 
+                          (user_id, message.text))
+                # Добавляем связь ученика с классом
+                c.execute("INSERT INTO student_classes (student_id, class_id) VALUES (?, ?)",
+                          (user_id, class_id))
+                conn.commit()
+            await message.reply("Вы успешно зарегистрированы!")
+            await show_class_selection(message)
         elif user_type == 'учитель':
             with get_db_connection() as conn:
                 c = conn.cursor()
                 c.execute("INSERT INTO teachers (id, name) VALUES (?, ?)", 
-                          (message.from_user.id, message.text))
+                          (user_id, message.text))
                 conn.commit()
-            await message.reply("Регистрация учителя завершена!", reply_markup=get_teacher_keyboard())
-        elif user_type == 'ученик':
-            await message.reply("Для регистрации ученика необходима ссылка-приглашение от учителя.")
+            await message.reply("Регистрация учителя завершена!", 
+                              reply_markup=get_teacher_keyboard())
         
     except sqlite3.IntegrityError:
         await message.reply("Ошибка: этот пользователь уже зарегистрирован.")
@@ -415,12 +570,13 @@ async def show_classes(message: types.Message):
             await message.reply("Вы не состоите в классе.")
 @dp.message(F.text == "📝 Отправить работу")
 async def start_submission(message: types.Message, state: FSMContext):
-    student_class_id = get_student_class(message.from_user.id)
-    if not student_class_id:
-        await message.reply("Вы не зарегистрированы в классе.")
+    data = await state.get_data()
+    current_class_id = data.get('current_class_id')
+    if not current_class_id:
+        await message.reply("Пожалуйста, сначала выберите класс.")
         return
-    
-    assignments = get_class_assignments(student_class_id)
+
+    assignments = get_class_assignments(current_class_id)
     if not assignments:
         await message.reply("В вашем классе пока нет заданий.")
         return
@@ -598,24 +754,7 @@ async def process_select_generated_assignment(callback: types.CallbackQuery, sta
         logger.error(f"Ошибка при обработке выбора задания: {e}")
         await callback.answer("Произошла ошибка при выборе задания.")
 
-async def delete_old_messages(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    old_assignment_message_id = data.get('old_assignment_message_id')
-    old_menu_message_id = data.get('old_menu_message_id')
 
-    # Удаляем старое сообщение с заданием
-    if old_assignment_message_id:
-        try:
-            await bot.delete_message(chat_id=callback.message.chat.id, message_id=old_assignment_message_id)
-        except Exception as e:
-            logger.error(f"Ошибка при удалении старого сообщения с заданием: {e}")
-
-    # Удаляем старое меню
-    if old_menu_message_id:
-        try:
-            await bot.delete_message(chat_id=callback.message.chat.id, message_id=old_menu_message_id)
-        except Exception as e:
-            logger.error(f"Ошибка при удалении старого меню: {e}")
 
 @dp.callback_query(F.data == "select_deadline")
 async def process_select_deadline(callback: types.CallbackQuery, state: FSMContext):
@@ -872,7 +1011,7 @@ async def process_time_selection(callback: types.CallbackQuery, state: FSMContex
         
         # Создание нового сообщения задания
         try:
-            new_assignment_message = await callback.message.answer(f"Задание создано успешно! ID: {new_assignment_id}")
+            new_assignment_message = await callback.message.answer(f"Задание создано успешно!")
             logger.info(f"Новое сообщение задания создано. ID: {new_assignment_message.message_id}")
         except Exception as e:
             logger.error(f"Ошибка при создании нового сообщения задания: {e}")
@@ -930,32 +1069,15 @@ async def show_links(message: types.Message):
         logger.error(f"Ошибка при отображении ссылок: {e}")
         await message.reply("Произошла ошибка при получении ссылок. Попробуйте позже.")
 
-@dp.message(F.text.startswith("/copy_"))
-async def copy_link(message: types.Message):
-    command, class_id = message.text.split("_", 1)
-    class_id = int(class_id)
-    
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("SELECT link FROM links WHERE class_id = ?", (class_id,))
-        link_result = c.fetchone()
-        
-        if link_result:
-            link = link_result[0]
-            await message.reply(f"Ссылка скопирована: {link}")
-            # Добавьте код здесь, чтобы фактически скопировать ссылку в буфер обмена пользователя
-        else:
-            await message.reply("Ссылка не найдена.")
 @dp.message(F.text == "📚 Мои задания")
 async def show_assignments(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    student_class_id = get_student_class(user_id)
-
-    if not student_class_id:
-        await message.reply("Вы не зарегистрированы в классе.")
+    data = await state.get_data()
+    current_class_id = data.get('current_class_id')
+    if not current_class_id:
+        await message.reply("Пожалуйста, сначала выберите класс.")
         return
 
-    assignments = get_class_assignments(student_class_id)
+    assignments = get_class_assignments(current_class_id)
     total_assignments = len(assignments)
 
     if total_assignments == 0:
@@ -1155,24 +1277,22 @@ async def process_class_name(message: types.Message, state: FSMContext):
     class_name = message.text.strip()
     with get_db_connection() as conn:
         c = conn.cursor()
+        # Сначала создаем класс и получаем его ID
         c.execute("INSERT INTO classes (teacher_id, class_name) VALUES (?, ?)", 
                   (message.from_user.id, class_name))
-        class_id = c.lastrowid
-        conn.commit()
+        class_id = c.lastrowid  # Получаем ID только что созданного класса
         
-        # Генерация уникальной реферальной ссылки
-        ref_link = f"https://t.me/edustud_bot?start={class_id}"
+        # Теперь генерируем реферальную ссылку с полученным class_id
+        ref_link, hashed_link = generate_referral_link(class_id)
         
-        # Хранение реферальной ссылки в таблице links
-        c.execute("INSERT INTO links (class_id, link) VALUES (?, ?)", 
+        # Добавляем ссылку в таблицу links
+        c.execute("INSERT INTO links (class_id, link) VALUES (?, ?)",
                   (class_id, ref_link))
+        
         conn.commit()
     
-    await message.reply("Класс создан!")
+    await message.reply(f"Класс '{class_name}' создан! Ваша реферальная ссылка: {ref_link}")
     await state.clear()
-
-# Statistics
-
 
 @dp.message(F.text == "📊 Статистика класса")
 async def show_class_statistics(message: types.Message):
@@ -1214,74 +1334,604 @@ async def show_class_statistics(message: types.Message):
             await message.answer(f"Произошла ошибка при получении статистики для класса {class_name}")
 # Teacher assignments
 @dp.message(F.text == "📝 Посмотреть мои задания")
-async def show_teacher_assignments(message: types.Message, state: FSMContext):
-    if not is_teacher(message.from_user.id):
-        await message.reply("Эта функция доступна только для учителей.")
-        return
-    
-    assignments = get_teacher_assignments(message.from_user.id)
-    total_assignments = len(assignments)
+async def show_assignments(message: types.Message):
+    try:
+        teacher_id = message.from_user.id
+        
+        if not is_teacher(teacher_id):
+            await message.answer("Эта функция доступна только для учителей.")
+            return
+        
+        # Получаем список классов учителя
+        classes = get_teacher_classes(teacher_id)
+        
+        if not classes:
+            await message.answer("У вас пока нет классов.")
+            return
+        
+        # Создаем клавиатуру с классами
+        keyboard = InlineKeyboardBuilder()
+        for class_id, class_name in classes:
+            keyboard.add(InlineKeyboardButton(
+                text=class_name,
+                callback_data=f"view_assignments_{class_id}_0"  # Добавляем индекс страницы
+            ))
+        keyboard.adjust(1)
+        
+        await message.answer(
+            "Выберите класс для просмотра заданий:",
+            reply_markup=keyboard.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе классов: {e}")
+        await message.answer("Произошла ошибка. Пожалуйста, попробуйте позже.")
 
-    if total_assignments == 0:
-        await message.reply("У вас пока нет созданных заданий.")
-        return
+@dp.callback_query(lambda c: c.data.startswith('view_assignments_'))
+async def show_class_assignments(callback: CallbackQuery):
+    try:
+        parts = callback.data.split('_')
+        if len(parts) < 3:
+            await callback.answer("Неверный формат данных")
+            return
+        
+        class_id = parts[2]
+        page = int(parts[3]) if len(parts) > 3 else 0
+        
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT a.id, a.text, strftime('%Y-%m-%d %H:%M', a.deadline) as deadline
+                FROM assignments a
+                WHERE a.class_id = ?
+                ORDER BY a.deadline DESC
+            """, (class_id,))
+            
+            assignments = c.fetchall()
+            
+            if not assignments:
+                await callback.message.edit_text("В этом классе пока нет заданий.")
+                return
 
-    # Сохраняем задания и текущую страницу в состоянии
-    await state.update_data(assignments=assignments, current_page=0)
-    await send_assignments_page(chat_id=message.chat.id, message_id=message.message_id, assignments=assignments, page=0)
+            # Показываем только одно задание на странице
+            total_assignments = len(assignments)
+            if page >= total_assignments:
+                page = total_assignments - 1
+            elif page < 0:
+                page = 0
 
+            assignment = assignments[page]
+            assignment_id, text, deadline = assignment
+
+            response = f"📚 Задание {page + 1} из {total_assignments}:\n\n"
+            response += f"📌 <b>Задание {assignment_id}:</b>\n{text}\n"
+            
+            if deadline:
+                deadline_dt = datetime.strptime(deadline, '%Y-%m-%d %H:%M')
+                deadline_str = deadline_dt.strftime('%d.%m.%Y %H:%M')
+                response += f"⏰ <b>Дедлайн:</b> {deadline_str}\n"
+            else:
+                response += "⏰ <b>Дедлайн:</b> Не указан\n"
+
+            # Создаем клавиатуру с кнопками навигации
+            keyboard = InlineKeyboardBuilder()
+            
+            # Кнопка "Назад" если не первая страница
+            if page > 0:
+                keyboard.add(InlineKeyboardButton(
+                    text="◀️ Предыдущее",
+                    callback_data=f"view_assignments_{class_id}_{page-1}"
+                ))
+
+            # Кнопка "Вперед" если не последняя страница
+            if page < total_assignments - 1:
+                keyboard.add(InlineKeyboardButton(
+                    text="Следующее ▶️",
+                    callback_data=f"view_assignments_{class_id}_{page+1}"
+                ))
+
+            # Кнопка удаления задания
+            keyboard.add(InlineKeyboardButton(
+                text="🗑 Удалить задание",
+                callback_data=f"delete_assignment_{class_id}_{assignment_id}"
+            ))
+
+            # Кнопка возврата к классам
+            keyboard.add(InlineKeyboardButton(
+                text="◀️ К списку классов",
+                callback_data="back_to_classes"
+            ))
+
+            keyboard.adjust(2)  # Размещаем кнопки по 2 в ряд
+            
+            await callback.message.edit_text(
+                response,
+                reply_markup=keyboard.as_markup(),
+                parse_mode="HTML"
+            )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе заданий класса: {e}")
+        await callback.message.edit_text("Произошла ошибка при получении заданий. Пожалуйста, попробуйте позже.")
+
+@dp.callback_query(lambda c: c.data.startswith('delete_assignment_'))
+async def delete_assignment(callback: CallbackQuery):
+    try:
+        # Получаем все части callback data
+        parts = callback.data.split('_')
+        class_id = parts[2]
+        assignment_id = parts[3]
+        
+        # Удаляем задание из базы данных
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            # Сначала удаляем все связанные submissions
+            c.execute("DELETE FROM submissions WHERE assignment_id = ?", (assignment_id,))
+            # Затем удаляем само задание
+            c.execute("DELETE FROM assignments WHERE id = ? AND class_id = ?", 
+                     (assignment_id, class_id))
+            conn.commit()
+        
+        await callback.answer("Задание успешно удалено!")
+        
+        # Получаем список оставшихся заданий
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT a.id, a.text, strftime('%Y-%m-%d %H:%M', a.deadline) as deadline
+                FROM assignments a
+                WHERE a.class_id = ?
+                ORDER BY a.deadline DESC
+            """, (class_id,))
+            
+            assignments = c.fetchall()
+            
+            if not assignments:
+                await callback.message.edit_text("В этом классе больше нет заданий.")
+                return
+
+            # Показываем первое задание
+            assignment = assignments[0]
+            assignment_id, text, deadline = assignment
+
+            response = f"📚 Задание 1 из {len(assignments)}:\n\n"
+            response += f"📌 <b>Задание {assignment_id}:</b>\n{text}\n"
+            
+            if deadline:
+                deadline_dt = datetime.strptime(deadline, '%Y-%m-%d %H:%M')
+                deadline_str = deadline_dt.strftime('%d.%m.%Y %H:%M')
+                response += f"⏰ <b>Дедлайн:</b> {deadline_str}\n"
+            else:
+                response += "⏰ <b>Дедлайн:</b> Не указан\n"
+
+            # Создаем клавиатуру
+            keyboard = InlineKeyboardBuilder()
+            
+            # Кнопка "Вперед" если есть следующее задание
+            if len(assignments) > 1:
+                keyboard.add(InlineKeyboardButton(
+                    text="Следующее ▶️",
+                    callback_data=f"view_assignments_{class_id}_1"
+                ))
+
+            # Кнопка удаления задания
+            keyboard.add(InlineKeyboardButton(
+                text="🗑 Удалить задание",
+                callback_data=f"delete_assignment_{class_id}_{assignment_id}"
+            ))
+
+            # Кнопка возврата к классам
+            keyboard.add(InlineKeyboardButton(
+                text="◀️ К списку классов",
+                callback_data="back_to_classes"
+            ))
+
+            keyboard.adjust(2)
+
+            await callback.message.edit_text(
+                response,
+                reply_markup=keyboard.as_markup(),
+                parse_mode="HTML"
+            )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при удалении задания: {e}")
+        await callback.answer("Произошла ошибка при удалении задания.")
+
+# Обработчик для кнопки "Назад к списку классов"
+@dp.callback_query(lambda c: c.data == 'back_to_classes')
+async def back_to_classes(callback: CallbackQuery):
+    try:
+        teacher_id = callback.from_user.id
+        classes = get_teacher_classes(teacher_id)
+        
+        keyboard = InlineKeyboardBuilder()
+        for class_id, class_name in classes:
+            keyboard.add(InlineKeyboardButton(
+                text=class_name,
+                callback_data=f"view_assignments_{class_id}"
+            ))
+        keyboard.adjust(1)
+        
+        await callback.message.edit_text(
+            "Выберите класс для просмотра заданий:",
+            reply_markup=keyboard.as_markup()
+        )
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Ошибка при возврате к списку классов: {e}")
+        await callback.message.edit_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
 
 # Student grades
 @dp.message(F.text == "📊 Посмотреть оценки учеников")
-async def show_student_grades(message: types.Message):
-    if not is_teacher(message.from_user.id):
-        await message.reply("Эта функция доступна только для учителей.")
-        return
-    
-    classes = get_teacher_classes(message.from_user.id)
-    if not classes:
-        await message.reply("У вас пока нет классов.")
-        return
-    
-    response = "📊 Оценки учеников по классам:\n\n"
-    
-    for class_id, class_name in classes:
-        grades = get_student_grades(class_id)
-        if grades:
-            response += f"Класс: {class_name}\n"
-            for student_name, assignment_text, evaluation in grades:
-                response += f"👤 Студент: {student_name}\n"
-                response += f"📝 Задание: {assignment_text}\n"
-                response += f"📈 Оценка: {evaluation}/10\n\n"
+async def show_classes_for_grades(message: Union[Message, CallbackQuery]):
+    try:
+        if isinstance(message, CallbackQuery):
+            message = message.message
+        
+        teacher_id = message.from_user.id
+        
+        # Получаем список классов
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, class_name 
+                FROM classes 
+                WHERE teacher_id = ?
+                ORDER BY class_name
+            """, (teacher_id,))
+            classes = c.fetchall()
+        
+        if not classes:
+            await message.answer("У вас пока нет назначенных классов.")
+            return
+        
+        # Создаем клавиатуру с классами
+        keyboard = InlineKeyboardBuilder()
+        for class_id, class_name in classes:
+            keyboard.add(InlineKeyboardButton(
+                text=class_name,
+                callback_data=f"grades_class_{class_id}"
+            ))
+        keyboard.adjust(1)
+        
+        await message.answer(
+            "Выберите класс для просмотра оценок:",
+            reply_markup=keyboard.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе классов для оценок: {e}")
+        await message.answer("Произошла ошибка. Пожалуйста, попробуйте позже.")
+
+@dp.callback_query(lambda c: c.data == "view_grades")
+async def show_classes_for_grades(callback: CallbackQuery):
+    await show_classes_for_grades(callback.message)
+
+
+@dp.callback_query(lambda c: c.data.startswith('grades_class_'))
+async def show_assignments_for_grades(callback_query: CallbackQuery):
+    try:
+        # Изменим эту строку
+        class_id = callback_query.data.split('_')[-1]
+        
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, text, strftime('%d.%m.%Y', deadline) as formatted_deadline
+                FROM assignments
+                WHERE class_id = ?
+                ORDER BY deadline DESC
+            """, (class_id,))
+            assignments = c.fetchall()
+        
+        if not assignments:
+            await callback_query.answer("В этом классе пока нет заданий.")
+            return
+        
+        keyboard = InlineKeyboardBuilder()
+        for assignment_id, text, deadline in assignments:
+            keyboard.add(InlineKeyboardButton(
+                text=f"{text[:20]}... ({deadline})" if len(text) > 20 else f"{text} ({deadline})",
+                callback_data=f"grades_assignment_{class_id}_{assignment_id}"
+            ))
+        keyboard.adjust(1)
+        
+        await callback_query.message.edit_text(
+            "Выберите задание для просмотра оценок:",
+            reply_markup=keyboard.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе заданий для оценок: {e}")
+        await callback_query.answer("Произошла ошибка. Пожалуйста, попробуйте позже.")
+
+@dp.callback_query(lambda c: c.data.startswith('show_students_'))
+async def show_students(callback_query: types.CallbackQuery):
+    try:
+        class_id = int(callback_query.data.split('_')[-1])
+        
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, name 
+                FROM students 
+                WHERE class_id = ?
+                ORDER BY name
+            """, (class_id,))
+            students = c.fetchall()
+        
+        if not students:
+            await callback_query.answer("В этом классе пока нет учеников.")
+            return
+        
+        student_list = "\n".join([f"{i+1}. {student[1]}" for i, student in enumerate(students)])
+        
+        # Создаем клавиатуру с кнопкой "Назад"
+        keyboard = InlineKeyboardBuilder()
+        keyboard.add(InlineKeyboardButton(text="◀️ Назад", callback_data=f"back_to_class_{class_id}"))
+        
+        await callback_query.message.edit_text(
+            f"Список учеников:\n\n{student_list}",
+            reply_markup=keyboard.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе списка учеников: {e}")
+        await callback_query.answer("Произошла ошибка. Пожалуйста, попробуйте позже.")
+async def show_class_menu(message: types.Message, class_id: int):
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text="📚 Задания", callback_data=f"assignments_{class_id}"))
+    keyboard.add(InlineKeyboardButton(text="👥 Список учеников", callback_data=f"show_students_{class_id}"))
+    keyboard.add(InlineKeyboardButton(text="🔗 Ссылки", callback_data=f"links_{class_id}"))
+    keyboard.adjust(1)
+
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT class_name FROM classes WHERE id = ?", (class_id,))
+        class_name = c.fetchone()[0]
+
+    await message.edit_text(f"Меню класса {class_name}:", reply_markup=keyboard.as_markup())
+@dp.callback_query(lambda c: c.data.startswith('grades_assignment_class_'))
+async def back_to_assignments_list(callback: CallbackQuery):
+    try:
+        # Получаем assignment_id из callback данных
+        assignment_id = callback.data.split('_')[3]
+        
+        # Получаем class_id из базы данных по assignment_id
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT class_id FROM assignments WHERE id = ?", (assignment_id,))
+            result = c.fetchone()
+            if not result:
+                await callback.answer("Задание не найдено")
+                return
+            class_id = result[0]
+
+        # Получаем список заданий для этого класса
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, text, strftime('%d.%m.%Y', deadline) as formatted_deadline
+                FROM assignments
+                WHERE class_id = ?
+                ORDER BY deadline DESC
+            """, (class_id,))
+            assignments = c.fetchall()
+
+        if assignments:
+            keyboard = InlineKeyboardBuilder()
+            for assignment_id, text, deadline in assignments:
+                keyboard.add(InlineKeyboardButton(
+                    text=f"{text[:20]}... ({deadline})" if len(text) > 20 else f"{text} ({deadline})",
+                    callback_data=f"grades_assignment_{class_id}_{assignment_id}"
+                ))
+            
+            # Добавляем кнопку возврата к списку классов
+            keyboard.add(InlineKeyboardButton(
+                text="◀️ К списку классов",
+                callback_data="back_to_classes_grades"
+            ))
+            
+            keyboard.adjust(1)
+            
+            await callback.message.edit_text(
+                "Выберите задание для просмотра оценок:",
+                reply_markup=keyboard.as_markup()
+            )
         else:
-            response += f"Класс: {class_name}\nНет оценок для этого класса.\n\n"
-    
-    await message.reply(response or "Нет оценок для всех классов.", parse_mode=ParseMode.MARKDOWN)
+            keyboard = InlineKeyboardBuilder()
+            keyboard.add(InlineKeyboardButton(
+                text="◀️ К списку классов",
+                callback_data="back_to_classes_grades"
+            ))
+            await callback.message.edit_text(
+                "В этом классе пока нет заданий.",
+                reply_markup=keyboard.as_markup()
+            )
 
-# Helper functions
-def get_student_grades(class_id):
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT st.name, a.text, s.evaluation
-            FROM submissions s
-            JOIN students st ON s.student_id = st.id
-            JOIN assignments a ON s.assignment_id = a.id
-            WHERE a.class_id = ?
-        """, (class_id,))
-        return c.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка при возврате к списку заданий: {e}")
+        await callback.answer("Произошла ошибка. Пожалуйста, попробуйте позже.")
 
-def get_teacher_assignments(teacher_id):
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT c.class_name, a.text, a.deadline
-            FROM assignments a
-            JOIN classes c ON a.class_id = c.id
-            WHERE c.teacher_id = ?
-            ORDER BY a.deadline
-        """, (teacher_id,))
-        return c.fetchall()
+@dp.callback_query(lambda c: c.data == "back_to_classes_grades")
+async def back_to_classes_grades(callback: CallbackQuery):
+    try:
+        teacher_id = callback.from_user.id
+        
+        # Получаем список классов учителя
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, class_name 
+                FROM classes 
+                WHERE teacher_id = ?
+                ORDER BY class_name
+            """, (teacher_id,))
+            classes = c.fetchall()
+
+        keyboard = InlineKeyboardBuilder()
+        
+        if classes:
+            for class_id, class_name in classes:
+                keyboard.add(InlineKeyboardButton(
+                    text=class_name,
+                    callback_data=f"grades_class_{class_id}"
+                ))
+            keyboard.adjust(1)
+            
+            await callback.message.edit_text(
+                "Выберите класс для просмотра оценок:",
+                reply_markup=keyboard.as_markup()
+            )
+        else:
+            await callback.message.edit_text(
+                "У вас пока нет классов.",
+                reply_markup=None
+            )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при возврате к списку классов: {e}")
+        await callback.message.edit_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
+
+@dp.callback_query(lambda c: c.data.startswith('grades_assignment_'))
+async def show_students_for_grades(callback: CallbackQuery):
+    try:
+        _, _, class_id, assignment_id = callback.data.split('_')
+        
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT s.id, s.name, sb.evaluation, sb.feedback
+                FROM students s
+                LEFT JOIN submissions sb ON s.id = sb.student_id 
+                    AND sb.assignment_id = ?
+                WHERE s.class_id = ?
+                ORDER BY s.name
+            """, (assignment_id, class_id))
+            students = c.fetchall()
+
+        keyboard = InlineKeyboardBuilder()
+        
+        if students:
+            message_text = "Список учеников и их оценки:\n\n"
+            for student_id, name, evaluation, feedback in students:
+                status = f" (Оценка: {evaluation}/10)" if evaluation is not None else " (Не оценено)"
+                keyboard.add(InlineKeyboardButton(
+                    text=f"👤 {name}{status}",
+                    callback_data=f"grade_student_{student_id}_{assignment_id}"
+                ))
+        else:
+            message_text = "В этом классе пока нет учеников."
+            
+        # Добавляем кнопку "Назад"
+        keyboard.add(InlineKeyboardButton(
+            text="◀️ Назад к заданиям",
+            callback_data=f"grades_class_{class_id}"
+        ))
+        
+        keyboard.adjust(1)
+        
+        await callback.message.edit_text(
+            message_text,
+            reply_markup=keyboard.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе учеников и оценок: {e}")
+        await callback.message.edit_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
+
+# Обработчик выбора ученика для выставления оценки
+@dp.callback_query(lambda c: c.data.startswith('grade_student_'))
+async def grade_student(callback: CallbackQuery, state: FSMContext):
+    try:
+        parts = callback.data.split('_')
+        if len(parts) < 4:
+            await callback.message.edit_text("Неверный формат данных.")
+            return
+        
+        student_id = parts[2]
+        assignment_id = parts[3]
+        
+        # Получаем информацию о студенте и его ответе
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT s.name, sb.evaluation, sb.answer, sb.feedback
+                FROM students s
+                LEFT JOIN submissions sb ON s.id = sb.student_id 
+                    AND sb.assignment_id = ?
+                WHERE s.id = ?
+            """, (assignment_id, student_id))
+            student_info = c.fetchone()
+            
+        if not student_info:
+            await callback.message.edit_text("Ученик не найден.")
+            return
+            
+        name, current_grade, answer, feedback = student_info  # Добавлен feedback
+        
+        message_text = f"Ученик: {name}\n\n"
+        if answer:
+            message_text += f"Ответ ученика: {answer}\n\n"
+        if feedback:  # Используем feedback вместо ai_feedback
+            message_text += f"Обратная связь от ИИ: {feedback}\n\n"
+        if current_grade is not None:
+            message_text += f"Текущая оценка: {current_grade}/10\n\n"
+        
+        keyboard = InlineKeyboardBuilder()
+        keyboard.button(
+            text="◀️ Назад к списку учеников",
+            callback_data=f"grades_assignment_class_{assignment_id}"
+        )
+        
+        await callback.message.edit_text(
+            message_text,
+            reply_markup=keyboard.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при выборе ученика: {e}")
+        await callback.message.edit_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
+
+@dp.callback_query(lambda c: c.data == 'back_to_classes_grades')
+async def back_to_classes_grades(callback: CallbackQuery):
+    try:
+        teacher_id = callback.from_user.id
+        
+        # Получаем список классов учителя
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT DISTINCT c.id, c.name 
+                FROM classes c
+                JOIN teacher_classes tc ON c.id = tc.class_id
+                WHERE tc.teacher_id = ?
+                ORDER BY c.name
+            """, (teacher_id,))
+            classes = c.fetchall()
+        
+        keyboard = InlineKeyboardBuilder()
+        for class_id, class_name in classes:
+            keyboard.add(InlineKeyboardButton(
+                text=class_name,
+                callback_data=f"grades_class_{class_id}"
+            ))
+        keyboard.adjust(1)
+        
+        await callback.message.edit_text(
+            "Выберите класс для просмотра оценок:",
+            reply_markup=keyboard.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при возврате к списку классов: {e}")
+        await callback.message.edit_text("Произошла ошибка. Пожалуйста, попробуйте позже.")
+
 
 def get_user_profile(user_id):
     with get_db_connection() as conn:
@@ -1407,18 +2057,6 @@ def get_assignment_results(assignment_id):
         }
     
     return formatted_results
-
-def get_teacher_id_for_assignment(assignment_id):
-    with get_db_connection() as conn:
-        c = conn.cursor()
-        c.execute("""
-            SELECT c.teacher_id
-            FROM assignments a
-            JOIN classes c ON a.class_id = c.id
-            WHERE a.id = ?
-        """, (assignment_id,))
-        result = c.fetchone()
-    return result[0] if result else None
 
 async def main():
     init_db()
